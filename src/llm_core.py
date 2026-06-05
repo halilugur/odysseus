@@ -380,6 +380,19 @@ def _parse_ollama_response(data: dict) -> str:
     return message.get("content") or data.get("response") or ""
 
 
+def _is_thinking_unsupported_error(raw: str) -> bool:
+    """True when an Ollama error body signals the model can't take a `think` flag.
+
+    Ollama answers `/api/chat` with HTTP 400 and a body like
+    ``{"error": "\"llama3.2\" does not support thinking"}`` when a `think`
+    field is sent to a model without thinking support. The `no_think_models`
+    list matches on substrings, so it can easily match such a model; sending
+    `think:false` would then hard-fail the whole chat. Detect that specific
+    rejection so the caller can retry without the flag.
+    """
+    return "does not support thinking" in (raw or "").lower()
+
+
 def _host_match(url: str, *domains: str) -> bool:
     """Return True if url's hostname equals any of `domains` or is a subdomain of one.
 
@@ -1320,57 +1333,77 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
     if provider == "ollama":
         _ollama_tool_calls: List[Dict] = []
         _harmony_router = _HarmonyStreamRouter()
+        _think_retry_done = False
         try:
             client = _get_http_client()
-            async with client.stream('POST', target_url, json=payload, headers=h, timeout=stream_timeout) as r:
-                _clear_host_dead(target_url)
-                if r.status_code != 200:
-                    raw = (await r.aread()).decode(errors="replace")
-                    friendly = _format_upstream_error(r.status_code, raw, target_url)
-                    yield f'event: error\ndata: {json.dumps({"status": r.status_code, "text": friendly, "raw": raw[:500]})}\n\n'
-                    return
-                async for line in r.aiter_lines():
-                    if not line:
-                        continue
-                    try:
-                        j = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    message = j.get("message") or {}
-                    thinking = message.get("thinking") or ""
-                    if thinking:
-                        if not suppress_thinking:
-                            yield _stream_delta_event(thinking, thinking=True)
-                    content = message.get("content") or ""
-                    if content:
-                        for part, is_thinking in _harmony_router.feed(content):
-                            if suppress_thinking and is_thinking:
-                                continue
-                            yield _stream_delta_event(part, thinking=is_thinking)
-                    for tc in message.get("tool_calls") or []:
-                        fn = tc.get("function") or {}
-                        if fn.get("name"):
-                            _ollama_tool_calls.append({
-                                "id": tc.get("id") or f"call_{len(_ollama_tool_calls)}",
-                                "name": fn.get("name") or "",
-                                "arguments": json.dumps(fn.get("arguments") or {}),
-                            })
-                    if j.get("done"):
-                        for part, is_thinking in _harmony_router.flush():
-                            if suppress_thinking and is_thinking:
-                                continue
-                            yield _stream_delta_event(part, thinking=is_thinking)
-                        if _ollama_tool_calls:
-                            yield f'data: {json.dumps({"type": "tool_calls", "calls": _ollama_tool_calls})}\n\n'
-                        if j.get("prompt_eval_count") is not None or j.get("eval_count") is not None:
-                            yield f'data: {json.dumps({"type": "usage", "data": {"input_tokens": j.get("prompt_eval_count", 0), "output_tokens": j.get("eval_count", 0)}})}\n\n'
-                        yield "data: [DONE]\n\n"
+            while True:
+                async with client.stream('POST', target_url, json=payload, headers=h, timeout=stream_timeout) as r:
+                    _clear_host_dead(target_url)
+                    if r.status_code != 200:
+                        raw = (await r.aread()).decode(errors="replace")
+                        # Some Ollama models reject an explicit `think` flag with
+                        # HTTP 400 ("does not support thinking"). The `no_think_models`
+                        # list matches on substrings, so it can match such a model and
+                        # turn a hide-the-reasoning request into a hard failure. The
+                        # SSE-level suppression below already drops any reasoning the
+                        # model emits, so the `think:false` hint is an optimization,
+                        # not a requirement — strip it and retry once instead of
+                        # failing the whole chat.
+                        if (
+                            r.status_code == 400
+                            and not _think_retry_done
+                            and payload.get("think") is not None
+                            and _is_thinking_unsupported_error(raw)
+                        ):
+                            _think_retry_done = True
+                            payload.pop("think", None)
+                            continue
+                        friendly = _format_upstream_error(r.status_code, raw, target_url)
+                        yield f'event: error\ndata: {json.dumps({"status": r.status_code, "text": friendly, "raw": raw[:500]})}\n\n'
                         return
-                for part, is_thinking in _harmony_router.flush():
-                    if suppress_thinking and is_thinking:
-                        continue
-                    yield _stream_delta_event(part, thinking=is_thinking)
-                yield "data: [DONE]\n\n"
+                    async for line in r.aiter_lines():
+                        if not line:
+                            continue
+                        try:
+                            j = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        message = j.get("message") or {}
+                        thinking = message.get("thinking") or ""
+                        if thinking:
+                            if not suppress_thinking:
+                                yield _stream_delta_event(thinking, thinking=True)
+                        content = message.get("content") or ""
+                        if content:
+                            for part, is_thinking in _harmony_router.feed(content):
+                                if suppress_thinking and is_thinking:
+                                    continue
+                                yield _stream_delta_event(part, thinking=is_thinking)
+                        for tc in message.get("tool_calls") or []:
+                            fn = tc.get("function") or {}
+                            if fn.get("name"):
+                                _ollama_tool_calls.append({
+                                    "id": tc.get("id") or f"call_{len(_ollama_tool_calls)}",
+                                    "name": fn.get("name") or "",
+                                    "arguments": json.dumps(fn.get("arguments") or {}),
+                                })
+                        if j.get("done"):
+                            for part, is_thinking in _harmony_router.flush():
+                                if suppress_thinking and is_thinking:
+                                    continue
+                                yield _stream_delta_event(part, thinking=is_thinking)
+                            if _ollama_tool_calls:
+                                yield f'data: {json.dumps({"type": "tool_calls", "calls": _ollama_tool_calls})}\n\n'
+                            if j.get("prompt_eval_count") is not None or j.get("eval_count") is not None:
+                                yield f'data: {json.dumps({"type": "usage", "data": {"input_tokens": j.get("prompt_eval_count", 0), "output_tokens": j.get("eval_count", 0)}})}\n\n'
+                            yield "data: [DONE]\n\n"
+                            return
+                    for part, is_thinking in _harmony_router.flush():
+                        if suppress_thinking and is_thinking:
+                            continue
+                        yield _stream_delta_event(part, thinking=is_thinking)
+                    yield "data: [DONE]\n\n"
+                break
         except (httpx.ConnectError, httpx.ConnectTimeout) as e:
             _cooled = _mark_host_dead(target_url)
             _tail = f" — host cooled for {DEAD_HOST_COOLDOWN:.0f}s" if _cooled else " — transient, will retry"

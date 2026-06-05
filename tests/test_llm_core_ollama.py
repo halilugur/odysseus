@@ -371,3 +371,111 @@ def test_stream_llm_ollama_suppresses_thinking_deltas(monkeypatch):
                         deltas.append(data)
 
     assert deltas == [{"delta": "visible answer"}]
+
+
+# ---------------------------------------------------------------------------
+# `think:false` graceful fallback
+#
+# Ollama answers /api/chat with HTTP 400 ("does not support thinking") when a
+# `think` flag is sent to a model that lacks thinking support. The no_think_models
+# list matches on substrings, so it can match such a model — turning a
+# hide-the-reasoning request into a hard failure. stream_llm must strip the flag
+# and retry once rather than surfacing the 400.
+# ---------------------------------------------------------------------------
+
+
+class _FakeErrorResp:
+    def __init__(self, status_code, body=b""):
+        self.status_code = status_code
+        self._body = body
+
+    async def aiter_lines(self):
+        if False:
+            yield ""  # pragma: no cover - never iterated on an error
+
+    async def aread(self):
+        return self._body
+
+
+class _FakeErrorCtx:
+    def __init__(self, resp):
+        self._resp = resp
+
+    async def __aenter__(self):
+        return self._resp
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class _FakeSequencedClient:
+    """Returns a queued response (error or streaming) on each stream() call and
+    records the payload it was handed."""
+
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self.payloads = []
+
+    def stream(self, method, url, json=None, headers=None, timeout=None):
+        self.payloads.append(dict(json) if isinstance(json, dict) else json)
+        resp = self._responses.pop(0)
+        if isinstance(resp, _FakeErrorResp):
+            return _FakeErrorCtx(resp)
+        return _FakeOllamaCtx(resp)
+
+
+def test_stream_llm_ollama_retries_without_think_on_unsupported(monkeypatch):
+    client = _FakeSequencedClient([
+        _FakeErrorResp(400, b'{"error": "\\"llama3.2\\" does not support thinking"}'),
+        [json.dumps({"message": {"content": "visible answer"}, "done": True})],
+    ])
+    monkeypatch.setattr(llm_core, "_get_http_client", lambda: client)
+
+    async def collect():
+        return [chunk async for chunk in llm_core.stream_llm(
+            "https://ollama.com/api",
+            "llama3.2",
+            [{"role": "user", "content": "hi"}],
+            suppress_thinking=True,
+        )]
+
+    out = asyncio.run(collect())
+
+    # First attempt carried think:false; the retry dropped it entirely.
+    assert client.payloads[0].get("think") is False
+    assert "think" not in client.payloads[1]
+
+    # The chat succeeds (no error event) and delivers the answer.
+    text = "".join(out)
+    assert "event: error" not in text
+    deltas = []
+    for chunk in out:
+        for raw in chunk.splitlines():
+            raw = raw.strip()
+            if raw.startswith("data:"):
+                body = raw[5:].strip()
+                if body.startswith("{"):
+                    data = json.loads(body)
+                    if "delta" in data:
+                        deltas.append(data["delta"])
+    assert deltas == ["visible answer"]
+
+
+def test_stream_llm_ollama_does_not_retry_other_400s(monkeypatch):
+    """A 400 unrelated to thinking is surfaced, not silently retried."""
+    client = _FakeSequencedClient([
+        _FakeErrorResp(400, b'{"error": "invalid model name"}'),
+    ])
+    monkeypatch.setattr(llm_core, "_get_http_client", lambda: client)
+
+    async def collect():
+        return [chunk async for chunk in llm_core.stream_llm(
+            "https://ollama.com/api",
+            "qwen3.6",
+            [{"role": "user", "content": "hi"}],
+            suppress_thinking=True,
+        )]
+
+    out = asyncio.run(collect())
+    assert len(client.payloads) == 1  # no retry
+    assert "event: error" in "".join(out)
