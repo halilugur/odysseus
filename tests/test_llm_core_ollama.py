@@ -1,4 +1,7 @@
 """Regression tests for native Ollama Cloud provider handling."""
+import asyncio
+import json
+
 import httpx
 
 from src import llm_core
@@ -240,3 +243,67 @@ def test_stream_llm_threads_discovered_num_ctx(monkeypatch):
     assert seen["num_ctx"] == 32768
     assert seen["stream"] is True
     assert out  # we got the SSE error chunk
+
+
+class _FakeOllamaResp:
+    status_code = 200
+
+    def __init__(self, lines):
+        self._lines = lines
+
+    async def aiter_lines(self):
+        for ln in self._lines:
+            yield ln
+
+    async def aread(self):
+        return b""
+
+
+class _FakeOllamaCtx:
+    def __init__(self, lines):
+        self._lines = lines
+
+    async def __aenter__(self):
+        return _FakeOllamaResp(self._lines)
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class _FakeOllamaClient:
+    def __init__(self, lines):
+        self._lines = lines
+
+    def stream(self, *args, **kwargs):
+        return _FakeOllamaCtx(self._lines)
+
+
+def test_stream_llm_ollama_suppresses_thinking_deltas(monkeypatch):
+    monkeypatch.setattr(llm_core, "_get_http_client", lambda: _FakeOllamaClient([
+        json.dumps({"message": {"thinking": "internal chain"}}),
+        json.dumps({"message": {"content": "visible answer"}, "done": True}),
+    ]))
+
+    async def collect():
+        chunks = []
+        async for chunk in llm_core.stream_llm(
+            "https://ollama.com/api",
+            "qwen3.6",
+            [{"role": "user", "content": "hi"}],
+            suppress_thinking=True,
+        ):
+            chunks.append(chunk)
+        return chunks
+
+    deltas = []
+    for chunk in asyncio.run(collect()):
+        for raw in chunk.splitlines():
+            raw = raw.strip()
+            if raw.startswith("data:"):
+                payload = raw[5:].strip()
+                if payload.startswith("{"):
+                    data = json.loads(payload)
+                    if "delta" in data:
+                        deltas.append(data)
+
+    assert deltas == [{"delta": "visible answer"}]

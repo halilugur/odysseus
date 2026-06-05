@@ -375,8 +375,12 @@ async function initDefaultChat() {
   var msg = el('set-defaultChatMsg');
   var fbContainer = el('set-defaultFallbacks');
   var addFbBtn = el('set-defaultAddFallback');
+  var noThinkChips = el('set-noThinkModelsChips');
+  var noThinkInput = el('set-noThinkModelInput');
+  var noThinkAddBtn = el('set-noThinkAddBtn');
   var _endpoints = [];
   var _fallbacks = []; // [{endpoint_id, model}] — tried in order if primary fails
+  var _noThinkModels = [];
 
   function enabledEndpoints() {
     return _endpoints.filter(function(e) { return e.is_enabled; });
@@ -457,6 +461,44 @@ async function initDefaultChat() {
     });
   }
 
+  function _cleanNoThinkModels(list) {
+    return Array.from(new Set((Array.isArray(list) ? list : [])
+      .map(function(v) { return String(v || '').trim(); })
+      .filter(Boolean)));
+  }
+
+  function renderNoThinkModels() {
+    if (!noThinkChips) return;
+    noThinkChips.innerHTML = '';
+    _noThinkModels.forEach(function(value) {
+      var chip = document.createElement('span');
+      chip.className = 'search-fb-chip';
+      chip.dataset.value = value;
+      chip.innerHTML = '<span>' + esc(value) + '</span>' +
+        '<button type="button" class="search-fb-remove" title="Remove">&times;</button>';
+      var rm = chip.querySelector('.search-fb-remove');
+      rm.addEventListener('click', function() {
+        _noThinkModels = _noThinkModels.filter(function(v) { return v !== value; });
+        renderNoThinkModels();
+        saveDefault();
+      });
+      noThinkChips.appendChild(chip);
+    });
+  }
+
+  function addNoThinkModel(raw) {
+    var value = String(raw || '').trim();
+    if (!value) return;
+    if (_noThinkModels.includes(value)) {
+      if (noThinkInput) noThinkInput.value = '';
+      return;
+    }
+    _noThinkModels.push(value);
+    renderNoThinkModels();
+    if (noThinkInput) noThinkInput.value = '';
+    saveDefault();
+  }
+
   try {
     var res = await fetch('/api/auth/settings', { credentials: 'same-origin' });
     var settings = await res.json();
@@ -467,7 +509,9 @@ async function initDefaultChat() {
           return { endpoint_id: (f && f.endpoint_id) || '', model: (f && f.model) || '' };
         })
       : [];
+    _noThinkModels = _cleanNoThinkModels(settings.no_think_models);
     renderFallbacks();
+    renderNoThinkModels();
   } catch (e) { console.warn('Failed to load default chat settings', e); }
 
   async function saveDefault() {
@@ -478,7 +522,8 @@ async function initDefaultChat() {
         body: JSON.stringify({
           default_endpoint_id: epSel.value,
           default_model: modelSel.value,
-          default_model_fallbacks: clean
+          default_model_fallbacks: clean,
+          no_think_models: _cleanNoThinkModels(_noThinkModels),
         })
       });
       msg.textContent = 'Saved'; msg.style.color = 'var(--fg)';
@@ -494,6 +539,18 @@ async function initDefaultChat() {
     renderFallbacks();
     saveDefault();
   });
+  if (noThinkAddBtn) {
+    noThinkAddBtn.addEventListener('click', function() {
+      addNoThinkModel(noThinkInput ? noThinkInput.value : '');
+    });
+  }
+  if (noThinkInput) {
+    noThinkInput.addEventListener('keydown', function(e) {
+      if (e.key !== 'Enter') return;
+      e.preventDefault();
+      addNoThinkModel(noThinkInput.value);
+    });
+  }
 
   _registerAiEndpointRefresh(function(endpoints) {
     _endpoints = endpoints;

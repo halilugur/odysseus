@@ -1242,7 +1242,7 @@ async def llm_call_async(
 async def stream_llm(url: str, model: str, messages: List[Dict], temperature: float = LLMConfig.DEFAULT_TEMPERATURE,
                      max_tokens: int = LLMConfig.DEFAULT_MAX_TOKENS, headers: Optional[Dict] = None,
                      timeout: int = LLMConfig.STREAM_TIMEOUT, prompt_type: Optional[str] = None,
-                     tools: Optional[List[Dict]] = None):
+                     tools: Optional[List[Dict]] = None, suppress_thinking: bool = False):
     """Stream LLM responses with improved error handling.
 
     Yields SSE chunks:
@@ -1335,10 +1335,13 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
                     message = j.get("message") or {}
                     thinking = message.get("thinking") or ""
                     if thinking:
-                        yield _stream_delta_event(thinking, thinking=True)
+                        if not suppress_thinking:
+                            yield _stream_delta_event(thinking, thinking=True)
                     content = message.get("content") or ""
                     if content:
                         for part, is_thinking in _harmony_router.feed(content):
+                            if suppress_thinking and is_thinking:
+                                continue
                             yield _stream_delta_event(part, thinking=is_thinking)
                     for tc in message.get("tool_calls") or []:
                         fn = tc.get("function") or {}
@@ -1350,6 +1353,8 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
                             })
                     if j.get("done"):
                         for part, is_thinking in _harmony_router.flush():
+                            if suppress_thinking and is_thinking:
+                                continue
                             yield _stream_delta_event(part, thinking=is_thinking)
                         if _ollama_tool_calls:
                             yield f'data: {json.dumps({"type": "tool_calls", "calls": _ollama_tool_calls})}\n\n'
@@ -1358,6 +1363,8 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
                         yield "data: [DONE]\n\n"
                         return
                 for part, is_thinking in _harmony_router.flush():
+                    if suppress_thinking and is_thinking:
+                        continue
                     yield _stream_delta_event(part, thinking=is_thinking)
                 yield "data: [DONE]\n\n"
         except (httpx.ConnectError, httpx.ConnectTimeout) as e:
@@ -1506,6 +1513,8 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
         events = []
         for part, is_thinking in parts:
             if is_thinking:
+                if suppress_thinking:
+                    continue
                 events.append(_stream_delta_event(part, thinking=True))
                 continue
             # Some thinking backends start normal content with a stray closing
@@ -1590,7 +1599,8 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
                                         # Reasoning tokens (VLLM --reasoning-parser, e.g. Qwen3/DeepSeek-R1, Nemotron). vLLM 0.20.2 / NIM emit the field as `reasoning`; older builds use `reasoning_content`. Some OpenAI-compatible Ollama builds use `thinking`.
                                         reasoning = delta.get("reasoning_content") or delta.get("reasoning") or delta.get("thinking") or ""
                                         if reasoning:
-                                            yield _stream_delta_event(reasoning, thinking=True)
+                                            if not suppress_thinking:
+                                                yield _stream_delta_event(reasoning, thinking=True)
                                         content = delta.get("content") or ""
                                         if content:
                                             stripped = content.lstrip()
@@ -1625,7 +1635,8 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
                                                         regular_part = content[close_idx + len("</think>"):]
                                                         _in_think_tag = False
                                                         if think_part:
-                                                            yield f'data: {json.dumps({"delta": think_part, "thinking": True})}\n\n'
+                                                            if not suppress_thinking:
+                                                                yield f'data: {json.dumps({"delta": think_part, "thinking": True})}\n\n'
                                                         if regular_part:
                                                             _first_content_sent = True
                                                             yield f'data: {json.dumps({"delta": regular_part})}\n\n'
@@ -1638,7 +1649,8 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
                                                                 content = stripped[tag_end + 1:]
                                                             _think_open_stripped = True
                                                         if content:
-                                                            yield f'data: {json.dumps({"delta": content, "thinking": True})}\n\n'
+                                                            if not suppress_thinking:
+                                                                yield f'data: {json.dumps({"delta": content, "thinking": True})}\n\n'
                                                 else:
                                                     # Some thinking backends start normal content with a
                                                     # stray closing tag. Repair only that shape; do not
