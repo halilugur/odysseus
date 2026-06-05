@@ -125,6 +125,7 @@ DEFAULT_SETTINGS = {
     # before producing output (endpoint offline / errors), the chat
     # dispatch retries the next entry in order.
     "default_model_fallbacks": [],
+    "no_think_models": [],
     "utility_endpoint_id": "",
     "utility_model": "",
     # Ordered fallback chain for the Utility model (summarization, naming,

@@ -60,6 +60,15 @@ def _stream_set(session_id: str, **fields) -> None:
     rec.update(fields)
 
 
+def _matches_no_think_models(model: str) -> bool:
+    from src.settings import get_setting
+    no_think = get_setting("no_think_models", [])
+    if not isinstance(no_think, list) or not no_think:
+        return False
+    model_lower = (model or "").lower()
+    return any(isinstance(p, str) and p and p.lower() in model_lower for p in no_think)
+
+
 def _session_url_matches_endpoint(session_url: str, endpoint_base: str) -> bool:
     if not session_url or not endpoint_base:
         return False
@@ -642,6 +651,7 @@ def setup_chat_routes(
         _global_disabled = get_setting("disabled_tools", [])
         if _global_disabled and isinstance(_global_disabled, list):
             disabled_tools.update(_global_disabled)
+        _suppress_thinking = _matches_no_think_models(sess.model)
 
         # Light auto-escalation: the user is in chat mode and just expressed a
         # notes/calendar/email intent. Grant the relevant managers but withhold
@@ -907,6 +917,7 @@ def setup_chat_routes(
                         max_tokens=ctx.preset.max_tokens,
                         prompt_type=preset_id,
                         tools=None,
+                        suppress_thinking=_suppress_thinking,
                     ):
                         if chunk.startswith("data: ") and not chunk.startswith("data: [DONE]"):
                             try:
@@ -1036,6 +1047,7 @@ def setup_chat_routes(
                         workspace=workspace or None,
                         plan_mode=plan_mode,
                         approved_plan=approved_plan or None,
+                        suppress_thinking=_suppress_thinking,
                     ):
                         if chunk.startswith("data: ") and not chunk.startswith("data: [DONE]"):
                             try:
@@ -1288,6 +1300,7 @@ def setup_chat_routes(
                 f"Instruction: {instruction}"
             )},
         ]
+        _suppress_thinking = _matches_no_think_models(sess.model)
 
         async def stream_rewrite() -> AsyncGenerator[str, None]:
             full_response = ""
@@ -1304,6 +1317,7 @@ def setup_chat_routes(
                     # on "Rewriting...". Same fix as the chat max_tokens cap.
                     max_tokens=0,
                     tools=None,
+                    suppress_thinking=_suppress_thinking,
                 ):
                     if chunk.startswith("data: ") and not chunk.startswith("data: [DONE]"):
                         try:

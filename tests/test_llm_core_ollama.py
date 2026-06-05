@@ -1,4 +1,7 @@
 """Regression tests for native Ollama Cloud provider handling."""
+import asyncio
+import json
+
 import httpx
 
 from src import llm_core
@@ -103,6 +106,17 @@ def test_ollama_payload_leaves_plain_messages_untouched():
     msgs = [{"role": "user", "content": "hello"}]
     payload = llm_core._build_ollama_payload("m", msgs, temperature=0.0, max_tokens=0)
     assert payload["messages"][0] == {"role": "user", "content": "hello"}
+
+
+def test_ollama_payload_sets_think_flag_when_given():
+    payload = llm_core._build_ollama_payload(
+        "m",
+        [{"role": "user", "content": "hello"}],
+        temperature=0.0,
+        max_tokens=0,
+        think=False,
+    )
+    assert payload["think"] is False
 
 
 def test_ollama_payload_tolerates_malformed_arguments():
@@ -240,3 +254,228 @@ def test_stream_llm_threads_discovered_num_ctx(monkeypatch):
     assert seen["num_ctx"] == 32768
     assert seen["stream"] is True
     assert out  # we got the SSE error chunk
+
+
+def test_stream_llm_includes_think_false_in_payload_when_suppressed(monkeypatch):
+    seen = {}
+
+    def spy_build_ollama_payload(*args, **kwargs):
+        seen["think"] = kwargs.get("think")
+        return {
+            "model": "qwen3.6",
+            "messages": [{"role": "user", "content": "x"}],
+            "stream": True,
+        }
+
+    monkeypatch.setattr(llm_core, "_build_ollama_payload", spy_build_ollama_payload)
+    monkeypatch.setattr(llm_core, "_is_host_dead", lambda url: True)
+
+    async def collect():
+        return [chunk async for chunk in llm_core.stream_llm(
+            "https://ollama.com/api",
+            "qwen3.6",
+            [{"role": "user", "content": "Say OK"}],
+            suppress_thinking=True,
+        )]
+
+    out = asyncio.run(collect())
+    assert seen["think"] is False
+    assert out
+
+
+def test_stream_llm_excludes_think_flag_from_payload_when_not_suppressed(monkeypatch):
+    seen = {}
+
+    def spy_build_ollama_payload(*args, **kwargs):
+        seen["think"] = kwargs.get("think")
+        return {
+            "model": "qwen3.6",
+            "messages": [{"role": "user", "content": "x"}],
+            "stream": True,
+        }
+
+    monkeypatch.setattr(llm_core, "_build_ollama_payload", spy_build_ollama_payload)
+    monkeypatch.setattr(llm_core, "_is_host_dead", lambda url: True)
+
+    async def collect():
+        return [chunk async for chunk in llm_core.stream_llm(
+            "https://ollama.com/api",
+            "qwen3.6",
+            [{"role": "user", "content": "Say OK"}],
+        )]
+
+    out = asyncio.run(collect())
+    assert seen["think"] is None
+    assert out
+
+
+class _FakeOllamaResp:
+    status_code = 200
+
+    def __init__(self, lines):
+        self._lines = lines
+
+    async def aiter_lines(self):
+        for ln in self._lines:
+            yield ln
+
+    async def aread(self):
+        return b""
+
+
+class _FakeOllamaCtx:
+    def __init__(self, lines):
+        self._lines = lines
+
+    async def __aenter__(self):
+        return _FakeOllamaResp(self._lines)
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class _FakeOllamaClient:
+    def __init__(self, lines):
+        self._lines = lines
+
+    def stream(self, *args, **kwargs):
+        return _FakeOllamaCtx(self._lines)
+
+
+def test_stream_llm_ollama_suppresses_thinking_deltas(monkeypatch):
+    monkeypatch.setattr(llm_core, "_get_http_client", lambda: _FakeOllamaClient([
+        json.dumps({"message": {"thinking": "internal chain"}}),
+        json.dumps({"message": {"content": "visible answer"}, "done": True}),
+    ]))
+
+    async def collect():
+        chunks = []
+        async for chunk in llm_core.stream_llm(
+            "https://ollama.com/api",
+            "qwen3.6",
+            [{"role": "user", "content": "hi"}],
+            suppress_thinking=True,
+        ):
+            chunks.append(chunk)
+        return chunks
+
+    deltas = []
+    for chunk in asyncio.run(collect()):
+        for raw in chunk.splitlines():
+            raw = raw.strip()
+            if raw.startswith("data:"):
+                payload = raw[5:].strip()
+                if payload.startswith("{"):
+                    data = json.loads(payload)
+                    if "delta" in data:
+                        deltas.append(data)
+
+    assert deltas == [{"delta": "visible answer"}]
+
+
+# ---------------------------------------------------------------------------
+# `think:false` graceful fallback
+#
+# Ollama answers /api/chat with HTTP 400 ("does not support thinking") when a
+# `think` flag is sent to a model that lacks thinking support. The no_think_models
+# list matches on substrings, so it can match such a model — turning a
+# hide-the-reasoning request into a hard failure. stream_llm must strip the flag
+# and retry once rather than surfacing the 400.
+# ---------------------------------------------------------------------------
+
+
+class _FakeErrorResp:
+    def __init__(self, status_code, body=b""):
+        self.status_code = status_code
+        self._body = body
+
+    async def aiter_lines(self):
+        return
+        yield ""  # pragma: no cover - empty async generator, never iterated
+
+    async def aread(self):
+        return self._body
+
+
+class _FakeErrorCtx:
+    def __init__(self, resp):
+        self._resp = resp
+
+    async def __aenter__(self):
+        return self._resp
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class _FakeSequencedClient:
+    """Returns a queued response (error or streaming) on each stream() call and
+    records the payload it was handed."""
+
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self.payloads = []
+
+    def stream(self, method, url, json=None, headers=None, timeout=None):
+        self.payloads.append(dict(json) if isinstance(json, dict) else json)
+        resp = self._responses.pop(0)
+        if isinstance(resp, _FakeErrorResp):
+            return _FakeErrorCtx(resp)
+        return _FakeOllamaCtx(resp)
+
+
+def test_stream_llm_ollama_retries_without_think_on_unsupported(monkeypatch):
+    client = _FakeSequencedClient([
+        _FakeErrorResp(400, b'{"error": "\\"llama3.2\\" does not support thinking"}'),
+        [json.dumps({"message": {"content": "visible answer"}, "done": True})],
+    ])
+    monkeypatch.setattr(llm_core, "_get_http_client", lambda: client)
+
+    async def collect():
+        return [chunk async for chunk in llm_core.stream_llm(
+            "https://ollama.com/api",
+            "llama3.2",
+            [{"role": "user", "content": "hi"}],
+            suppress_thinking=True,
+        )]
+
+    out = asyncio.run(collect())
+
+    # First attempt carried think:false; the retry dropped it entirely.
+    assert client.payloads[0].get("think") is False
+    assert "think" not in client.payloads[1]
+
+    # The chat succeeds (no error event) and delivers the answer.
+    text = "".join(out)
+    assert "event: error" not in text
+    deltas = []
+    for chunk in out:
+        for raw in chunk.splitlines():
+            raw = raw.strip()
+            if raw.startswith("data:"):
+                body = raw[5:].strip()
+                if body.startswith("{"):
+                    data = json.loads(body)
+                    if "delta" in data:
+                        deltas.append(data["delta"])
+    assert deltas == ["visible answer"]
+
+
+def test_stream_llm_ollama_does_not_retry_other_400s(monkeypatch):
+    """A 400 unrelated to thinking is surfaced, not silently retried."""
+    client = _FakeSequencedClient([
+        _FakeErrorResp(400, b'{"error": "invalid model name"}'),
+    ])
+    monkeypatch.setattr(llm_core, "_get_http_client", lambda: client)
+
+    async def collect():
+        return [chunk async for chunk in llm_core.stream_llm(
+            "https://ollama.com/api",
+            "qwen3.6",
+            [{"role": "user", "content": "hi"}],
+            suppress_thinking=True,
+        )]
+
+    out = asyncio.run(collect())
+    assert len(client.payloads) == 1  # no retry
+    assert "event: error" in "".join(out)

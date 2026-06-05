@@ -41,7 +41,7 @@ class _FakeClient:
         return _FakeStreamCtx(self._lines)
 
 
-def _run_stream(model, lines, monkeypatch):
+def _run_stream(model, lines, monkeypatch, suppress_thinking=False):
     """Drive stream_llm against a faked upstream and return parsed SSE payloads."""
     monkeypatch.setattr(llm_core, "_get_http_client", lambda: _FakeClient(lines))
 
@@ -51,6 +51,7 @@ def _run_stream(model, lines, monkeypatch):
             "http://nim-nano:8000/v1/chat/completions",
             model,
             [{"role": "user", "content": "hi"}],
+            suppress_thinking=suppress_thinking,
         ):
             out.append(chunk)
         return out
@@ -206,3 +207,33 @@ def test_harmony_analysis_channel_routes_to_thinking(monkeypatch):
     assert answer == "Here are the files."
     assert "<|channel|>" not in thinking + answer
     assert "<|message|>" not in thinking + answer
+
+
+def test_suppress_thinking_drops_reasoning_events(monkeypatch):
+    deltas = _run_stream(
+        "nvidia/nemotron-3-nano",
+        [
+            'data: {"choices":[{"delta":{"reasoning":"internal chain"}}]}',
+            'data: {"choices":[{"delta":{"content":"Visible answer"}}]}',
+            "data: [DONE]",
+        ],
+        monkeypatch,
+        suppress_thinking=True,
+    )
+    assert all(not d.get("thinking") for d in deltas), deltas
+    assert any(d["delta"] == "Visible answer" for d in deltas), deltas
+
+
+def test_suppress_thinking_keeps_think_tag_parsing_but_hides_think_events(monkeypatch):
+    deltas = _run_stream(
+        "Qwopus3-9B-custom",
+        [
+            'data: {"choices":[{"delta":{"content":"<think>step one"}}]}',
+            'data: {"choices":[{"delta":{"content":"</think>final answer"}}]}',
+            "data: [DONE]",
+        ],
+        monkeypatch,
+        suppress_thinking=True,
+    )
+    assert all(not d.get("thinking") for d in deltas), deltas
+    assert any("final answer" in d["delta"] for d in deltas), deltas
