@@ -256,7 +256,7 @@ def test_stream_llm_threads_discovered_num_ctx(monkeypatch):
     assert out  # we got the SSE error chunk
 
 
-def test_stream_llm_sends_think_false_when_suppressed(monkeypatch):
+def test_stream_llm_includes_think_false_in_payload_when_suppressed(monkeypatch):
     seen = {}
 
     def spy_build_ollama_payload(*args, **kwargs):
@@ -283,7 +283,7 @@ def test_stream_llm_sends_think_false_when_suppressed(monkeypatch):
     assert out
 
 
-def test_stream_llm_omits_think_flag_when_not_suppressed(monkeypatch):
+def test_stream_llm_excludes_think_flag_from_payload_when_not_suppressed(monkeypatch):
     seen = {}
 
     def spy_build_ollama_payload(*args, **kwargs):
