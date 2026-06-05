@@ -60,6 +60,15 @@ def _stream_set(session_id: str, **fields) -> None:
     rec.update(fields)
 
 
+def _matches_no_think_models(model: str) -> bool:
+    from src.settings import get_setting
+    no_think = get_setting("no_think_models", [])
+    if not isinstance(no_think, list) or not no_think:
+        return False
+    model_lower = (model or "").lower()
+    return any(isinstance(p, str) and p and p.lower() in model_lower for p in no_think)
+
+
 def _session_url_matches_endpoint(session_url: str, endpoint_base: str) -> bool:
     if not session_url or not endpoint_base:
         return False
@@ -642,14 +651,7 @@ def setup_chat_routes(
         _global_disabled = get_setting("disabled_tools", [])
         if _global_disabled and isinstance(_global_disabled, list):
             disabled_tools.update(_global_disabled)
-        _no_think = get_setting("no_think_models", [])
-        _suppress_thinking = False
-        if isinstance(_no_think, list) and _no_think:
-            _model_lower = (sess.model or "").lower()
-            _suppress_thinking = any(
-                isinstance(p, str) and p and p.lower() in _model_lower
-                for p in _no_think
-            )
+        _suppress_thinking = _matches_no_think_models(sess.model)
 
         # Light auto-escalation: the user is in chat mode and just expressed a
         # notes/calendar/email intent. Grant the relevant managers but withhold
@@ -1298,15 +1300,7 @@ def setup_chat_routes(
                 f"Instruction: {instruction}"
             )},
         ]
-        from src.settings import get_setting
-        _no_think = get_setting("no_think_models", [])
-        _suppress_thinking = False
-        if isinstance(_no_think, list) and _no_think:
-            _model_lower = (sess.model or "").lower()
-            _suppress_thinking = any(
-                isinstance(p, str) and p and p.lower() in _model_lower
-                for p in _no_think
-            )
+        _suppress_thinking = _matches_no_think_models(sess.model)
 
         async def stream_rewrite() -> AsyncGenerator[str, None]:
             full_response = ""
