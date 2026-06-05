@@ -378,6 +378,7 @@ async function initDefaultChat() {
   var noThinkChips = el('set-noThinkModelsChips');
   var noThinkInput = el('set-noThinkModelInput');
   var noThinkAddBtn = el('set-noThinkAddBtn');
+  var noThinkAddSelectedBtn = el('set-noThinkAddSelectedBtn');
   var _endpoints = [];
   var _fallbacks = []; // [{endpoint_id, model}] — tried in order if primary fails
   var _noThinkModels = [];
@@ -542,6 +543,11 @@ async function initDefaultChat() {
   if (noThinkAddBtn) {
     noThinkAddBtn.addEventListener('click', function() {
       addNoThinkModel(noThinkInput ? noThinkInput.value : '');
+    });
+  }
+  if (noThinkAddSelectedBtn) {
+    noThinkAddSelectedBtn.addEventListener('click', function() {
+      addNoThinkModel(modelSel ? modelSel.value : '');
     });
   }
   if (noThinkInput) {

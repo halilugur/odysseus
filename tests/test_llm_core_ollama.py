@@ -108,6 +108,17 @@ def test_ollama_payload_leaves_plain_messages_untouched():
     assert payload["messages"][0] == {"role": "user", "content": "hello"}
 
 
+def test_ollama_payload_sets_think_flag_when_given():
+    payload = llm_core._build_ollama_payload(
+        "m",
+        [{"role": "user", "content": "hello"}],
+        temperature=0.0,
+        max_tokens=0,
+        think=False,
+    )
+    assert payload["think"] is False
+
+
 def test_ollama_payload_tolerates_malformed_arguments():
     msgs = [{
         "role": "assistant",
@@ -243,6 +254,59 @@ def test_stream_llm_threads_discovered_num_ctx(monkeypatch):
     assert seen["num_ctx"] == 32768
     assert seen["stream"] is True
     assert out  # we got the SSE error chunk
+
+
+def test_stream_llm_sends_think_false_when_suppressed(monkeypatch):
+    seen = {}
+
+    def spy_build_ollama_payload(*args, **kwargs):
+        seen["think"] = kwargs.get("think")
+        return {
+            "model": "qwen3.6",
+            "messages": [{"role": "user", "content": "x"}],
+            "stream": True,
+        }
+
+    monkeypatch.setattr(llm_core, "_build_ollama_payload", spy_build_ollama_payload)
+    monkeypatch.setattr(llm_core, "_is_host_dead", lambda url: True)
+
+    async def collect():
+        return [chunk async for chunk in llm_core.stream_llm(
+            "https://ollama.com/api",
+            "qwen3.6",
+            [{"role": "user", "content": "Say OK"}],
+            suppress_thinking=True,
+        )]
+
+    out = asyncio.run(collect())
+    assert seen["think"] is False
+    assert out
+
+
+def test_stream_llm_omits_think_flag_when_not_suppressed(monkeypatch):
+    seen = {}
+
+    def spy_build_ollama_payload(*args, **kwargs):
+        seen["think"] = kwargs.get("think")
+        return {
+            "model": "qwen3.6",
+            "messages": [{"role": "user", "content": "x"}],
+            "stream": True,
+        }
+
+    monkeypatch.setattr(llm_core, "_build_ollama_payload", spy_build_ollama_payload)
+    monkeypatch.setattr(llm_core, "_is_host_dead", lambda url: True)
+
+    async def collect():
+        return [chunk async for chunk in llm_core.stream_llm(
+            "https://ollama.com/api",
+            "qwen3.6",
+            [{"role": "user", "content": "Say OK"}],
+        )]
+
+    out = asyncio.run(collect())
+    assert seen["think"] is None
+    assert out
 
 
 class _FakeOllamaResp:

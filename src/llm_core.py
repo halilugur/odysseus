@@ -341,6 +341,7 @@ def _build_ollama_payload(
     stream: bool = False,
     tools: Optional[List[Dict]] = None,
     num_ctx: Optional[int] = None,
+    think: Optional[bool] = None,
 ) -> Dict:
     """Build the JSON payload for Ollama's /api/chat endpoint.
 
@@ -358,6 +359,8 @@ def _build_ollama_payload(
         "messages": _ollama_normalize_tool_messages(messages),
         "stream": stream,
     }
+    if think is not None:
+        payload["think"] = bool(think)
     options: Dict = {}
     if temperature is not None:
         options["temperature"] = temperature
@@ -1280,6 +1283,7 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
         payload = _build_ollama_payload(
             model, messages_copy, temperature, max_tokens,
             stream=True, tools=tools, num_ctx=get_context_length(url, model),
+            think=False if suppress_thinking else None,
         )
     else:
         target_url = url
