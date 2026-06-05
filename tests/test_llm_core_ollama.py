@@ -390,8 +390,8 @@ class _FakeErrorResp:
         self._body = body
 
     async def aiter_lines(self):
-        if False:
-            yield ""  # pragma: no cover - never iterated on an error
+        return
+        yield ""  # pragma: no cover - empty async generator, never iterated
 
     async def aread(self):
         return self._body
